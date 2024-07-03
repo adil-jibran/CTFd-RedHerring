@@ -1,8 +1,9 @@
 import os
 import json
 
+import docker
 from flask import render_template, Blueprint
-from flask import request, jsonify,session
+from flask import request, jsonify, session
 
 from CTFd.models import (
     Awards,
@@ -35,36 +36,40 @@ from CTFd.config import Config
 PLUGIN_PATH = os.path.dirname(__file__)
 CONFIG = json.load(open("{}/config.json".format(PLUGIN_PATH)))
 
-directory_name = PLUGIN_PATH.split(os.sep)[-1] # Get the directory name of this file
+# Get the directory name of this file
+directory_name = PLUGIN_PATH.split(os.sep)[-1]
 
 red = Blueprint(directory_name, __name__, template_folder="templates")
+
 
 class RedHerringTypeChallenge(BaseChallenge):
     id = "red_herring"  # Unique identifier used to register challenges
     name = "red_herring"  # Name of a challenge type
     templates = {  # Nunjucks templates used for each aspect of challenge editing & viewing
-        'create': '/plugins/'+ directory_name +'/assets/create.html',  # Used to render the challenge when creating/editing
-        'update': '/plugins/' + directory_name + '/assets/update.html',  # Used to render the challenge when updating
-        'view': '/plugins/' + directory_name + '/assets/view.html',  # Used to render the challenge when viewing
+        # Used to render the challenge when creating/editing
+        'create': '/plugins/' + directory_name + '/assets/create.html',
+        # Used to render the challenge when updating
+        'update': '/plugins/' + directory_name + '/assets/update.html',
+        # Used to render the challenge when viewing
+        'view': '/plugins/' + directory_name + '/assets/view.html',
     }
     scripts = {  # Scripts that are loaded when a template is loaded
-        'create': '/plugins/'+ directory_name +'/assets/create.js',  # Used to init the create template JavaScript
-        'update': '/plugins/'+ directory_name +'/assets/update.js',  # Used to init the create template JavaScript
-        'view': '/plugins/'+ directory_name +'/assets/view.js',  # Used to init the create template JavaScript
+        # Used to init the create template JavaScript
+        'create': '/plugins/' + directory_name + '/assets/create.js',
+        # Used to init the create template JavaScript
+        'update': '/plugins/' + directory_name + '/assets/update.js',
+        # Used to init the create template JavaScript
+        'view': '/plugins/' + directory_name + '/assets/view.js',
     }
 
     # Route at which files are accessible. This must be registered using register_plugin_assets_directory()
-    route = '/plugins/'+ directory_name +'/assets/'
+    route = '/plugins/' + directory_name + '/assets/'
     challenge_model = RedHerringChallenge
-    
-    @staticmethod
-    def create(request):
-        """
-        This method is used to process the challenge creation request.
 
-        :param request:
-        :return:
-        """
+    @staticmethod
+    @red.route('/admin/red_herring', methods=['GET'])
+    @admins_only
+    def create(request):
         data = request.form or request.get_json()
         challenge = RedHerringChallenge(
             name=data['name'],
@@ -73,81 +78,78 @@ class RedHerringTypeChallenge(BaseChallenge):
             value=data['value'],
             state=data['state'],
             type=data['type'],
-            dockerfile= data['buildfile']
+            dockerfile=data['buildfile']
         )
-
         buildfile = data['buildfile']
 
         db.session.add(challenge)
         db.session.commit()
 
-        # Check if there is teams that are created
         teams = Teams.query.all()
-        if len(teams) > 0:
-
-            # Get the last port used
+        if teams:
             last_container = Containers.query.order_by(Containers.port.desc()).first()
-            if last_container_port is None:
-                port = globals.PORT_CONTAINERS_START
-            else:
-                port = last_container.port + 1
+            port = (last_container.port + 1) if last_container and last_container.port else globals.PORT_CONTAINERS_START
 
-            # For each team, create a flag and a container for the challenge
             for team in teams:
                 generated_flag = generate_flag()
 
-                # Generate the container
-                container_name = create_docker_container(buildfile=buildfile, flag=generated_flag, port=port, challenge_name=challenge.name, team_id=team.id)
+                # Retry logic for Docker container creation
+                for attempt in range(5):
+                    try:
+                        container_name = create_docker_container(
+                            buildfile=buildfile, flag=generated_flag, port=port, challenge_name=challenge.name, team_id=team.id
+                        )
+                        container = Containers(name=container_name, port=port, dockerfile=buildfile, challengeid=challenge.id, teamid=team.id)
+                        db.session.add(container)
 
-                # Save the container in the database
-                container = Containers(name=container_name, port=port, dockerfile=buildfile, challengeid=challenge.id, teamid=team.id)
-                port += 1
-                db.session.add(container)
+                        flag = Flags(challenge_id=challenge.id, type="red_herring", content=generated_flag, data=team.id)
+                        db.session.add(flag)
 
-                # Save the flag in the database
-                flag = Flags(challenge_id = challenge.id, type = "red_herring", content = generated_flag, data = team.id)
-                db.session.add(flag)
-                
+                        db.session.commit()
+                        port += 1
+                        break
+                    except docker.errors.APIError as e:
+                        # Handle port allocation error
+                        if "port is already allocated" in str(e):
+                            port += 1
+                        else:
+                            raise e
 
-            db.session.commit()
-            
-        
         return challenge
+
 
 class RedHearingFlag(CTFdStaticFlag):
     name = "red_herring"
 
     @staticmethod
     def compare(chal_key_obj, provided_flag):
-        # Get the actual flag to check for the challenge submitted (the function compare() is called for each flag of the challenge)
         saved_flag = chal_key_obj.content
-
-        # Compare each character in the flag if the team id is the one that is supposed to solve the challenge
         curr_team_id = get_current_team().id
 
         if len(saved_flag) != len(provided_flag):
             return False
-        
-        result = 0
 
+        result = 0
         for x, y in zip(saved_flag, provided_flag):
             result |= ord(x) ^ ord(y)
-        
+
         if result == 0:
-            # If the flag is correct, we need to check if the team is the one associated with the flag
             team_id_needed = chal_key_obj.data
             if int(team_id_needed) == int(curr_team_id):
                 return True
             else:
                 curr_user_id = get_current_user().id
-                cheater = CheaterTeams(challengeid=chal_key_obj.challenge_id, cheaterid=curr_user_id, cheatteamid=curr_team_id, sharerteamid=team_id_needed, flagid=chal_key_obj.id)
+                cheater = CheaterTeams(
+                    challengeid=chal_key_obj.challenge_id, cheaterid=curr_user_id,
+                    cheatteamid=curr_team_id, sharerteamid=team_id_needed, flagid=chal_key_obj.id
+                )
                 db.session.add(cheater)
                 return False
         else:
             return False
 
 
-@red.route('/admin/red_herring',methods=['GET'])
+@red.route('/admin/red_herring', methods=['GET'])
 @admins_only
 def show_cheaters():
     if request.method == 'GET':
@@ -157,13 +159,15 @@ def show_cheaters():
 
 def load(app):
     globals.initialize()
-    app.db.create_all() # Create all DB entities
+    app.db.create_all()
     upgrade(plugin_name="red_herring")
 
     CHALLENGE_CLASSES['red_herring'] = RedHerringTypeChallenge
     FLAG_CLASSES['red_herring'] = RedHearingFlag
 
     app.register_blueprint(red)
-    register_plugin_assets_directory(app, base_path='/plugins/'+ directory_name +'/assets/')
+    register_plugin_assets_directory(
+        app, base_path=f'/plugins/{directory_name}/assets/'
+    )
 
     load_hooks()
